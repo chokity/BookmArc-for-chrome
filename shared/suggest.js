@@ -1,0 +1,77 @@
+/* Address/search suggestions shared by the side panel address bar and the command bar. */
+
+import { isNewTabUrl } from "./store.js";
+
+/** Turn typed text into {url} or {search}. */
+export function resolve(text) {
+  const t = text.trim();
+  if (!t) return null;
+  if (/^(https?|file|ftp|chrome|chrome-extension|view-source|about|data):/i.test(t)) return { url: t };
+  if (!/\s/.test(t)) {
+    if (/^(localhost|\d{1,3}(\.\d{1,3}){3})(:\d+)?(\/.*)?$/i.test(t)) return { url: "http://" + t };
+    if (/^[\w-]+(\.[\w-]+)+(:\d+)?([/?#].*)?$/.test(t)) return { url: "https://" + t };
+  }
+  return { search: t };
+}
+
+/** Domain for http(s) pages, the URL otherwise, "" for new-tab pages. */
+export function pretty(url) {
+  if (isNewTabUrl(url)) return "";
+  try {
+    const u = new URL(url);
+    if (/^https?:$/.test(u.protocol)) return u.hostname.replace(/^www\./, "");
+  } catch {
+    // keep as-is
+  }
+  return url;
+}
+
+/** Navigate `tabId` to `target` ({url} or {search}). */
+export async function openIn(tabId, target) {
+  if (target.url) await chrome.tabs.update(tabId, { url: target.url });
+  else if (target.search) await chrome.search.query({ text: target.search, tabId });
+}
+
+export async function switchToTab(tab, fromWindowId) {
+  await chrome.tabs.update(tab.id, { active: true });
+  if (tab.windowId !== fromWindowId) await chrome.windows.update(tab.windowId, { focused: true });
+}
+
+/**
+ * Suggestions for typed text, best first:
+ *   {kind: "go"|"search"|"tab"|"history", label, sub, url?, icon?, tab?, target?}
+ * `tab` items switch to that tab; the others navigate to `target` ({url} or {search}).
+ */
+export async function suggestFor(text, { max = 12, excludeTabId = null } = {}) {
+  const out = [];
+  const r = resolve(text);
+  if (r?.url) out.push({ kind: "go", label: pretty(r.url) || r.url, sub: "Open", target: r });
+  out.push({ kind: "search", label: text, sub: "Search", target: { search: text } });
+
+  const q = text.toLowerCase();
+  const seen = new Set();
+  const tabs = (await chrome.tabs.query({ windowType: "normal" }))
+    .filter((t) => t.id !== excludeTabId && ((t.title || "").toLowerCase().includes(q) || (t.url || "").toLowerCase().includes(q)))
+    .slice(0, 4);
+  for (const t of tabs) {
+    seen.add(t.url);
+    out.push({ kind: "tab", tab: t, icon: t.favIconUrl, url: t.url, label: t.title || t.url, sub: "Switch to Tab" });
+  }
+
+  const history = await chrome.history.search({ text, maxResults: 25, startTime: 0 }).catch(() => []);
+  history.sort((a, b) => (b.visitCount || 0) - (a.visitCount || 0));
+  for (const item of history) {
+    if (seen.has(item.url) || out.length >= max) continue;
+    seen.add(item.url);
+    out.push({ kind: "history", url: item.url, label: item.title || item.url, sub: pretty(item.url), target: { url: item.url } });
+  }
+  return out;
+}
+
+/** Frequently visited sites, for the empty state. */
+export async function topSiteItems({ max = 6 } = {}) {
+  const sites = await chrome.topSites.get().catch(() => []);
+  return sites
+    .slice(0, max)
+    .map((s) => ({ kind: "history", url: s.url, label: s.title || pretty(s.url), sub: pretty(s.url), target: { url: s.url } }));
+}

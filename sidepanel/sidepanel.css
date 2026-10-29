@@ -1,0 +1,733 @@
+@import url("../shared/theme.css");
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+/* Row sizing; "Sizing…" in the menu overrides these. */
+:root {
+  --row-font: 14px;
+  --row-height: 36px;
+  --row-gap: 5px;
+  --indent: 16px;
+  --folder-icon: 18px;
+}
+
+body {
+  margin: 0;
+  padding: 8px 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bg, color-mix(in srgb, var(--space) var(--tint), var(--base))); /* --bg: exact, from theme.js */
+  color: var(--fg);
+  font: 13px/1.3 system-ui, -apple-system, "Segoe UI", sans-serif;
+  user-select: none;
+  overflow: hidden;
+  transition: background 250ms ease;
+}
+
+button { font: inherit; color: inherit; }
+
+svg { display: block; }
+
+.icon-btn {
+  flex: none;
+  width: 24px; height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  padding: 0;
+  cursor: default;
+}
+.icon-btn:hover:not(:disabled) { background: var(--btn-hover); color: var(--fg); }
+.icon-btn:disabled { opacity: 0.4; }
+.icon-btn svg { width: 15px; height: 15px; }
+
+/* ---------- Search ---------- */
+
+.search {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: var(--radius);
+  background: var(--field);
+  color: var(--muted);
+  transition: background 120ms, box-shadow 120ms;
+}
+.search:hover { background: color-mix(in srgb, var(--field), #000 4%); }
+.search:focus-within { background: var(--field-focus); box-shadow: var(--shadow), 0 0 0 2px color-mix(in srgb, var(--space) 55%, transparent); }
+.search svg { width: 14px; height: 14px; flex: none; }
+#search {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  outline: 0;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+}
+#search::placeholder { color: var(--muted); }
+/* Our own "×" (search-clear) instead of Chrome's: Firefox has none, and both look the same this way. */
+#search::-webkit-search-cancel-button { display: none; }
+.search-clear { width: 20px; height: 20px; margin-inline-end: -4px; border-radius: 50%; }
+.search-clear svg { width: 11px; height: 11px; }
+.search-clear[hidden] { display: none; }
+
+/* While searching: hits only. The pinned list shows even when folded away, and
+   what only makes sense for the whole list steps aside. */
+body.searching #pinned { max-height: none; overflow: visible; }
+body.searching #pinned:not(:has(.tab))::after { content: none; }
+body.searching .divider-row, body.searching #new-tab { display: none; }
+body.no-hits .scroll::before {
+  content: "No bookmarks or tabs found";
+  padding: 16px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* ---------- Favorites grid ---------- */
+
+.fav-grid {
+  display: grid;
+  /* Four across at the usual width. Dragging the sidebar wider adds columns
+     rather than inflating the tiles — favorites stay a quiet strip, not the
+     biggest thing in the sidebar. The panel is its own document, so these
+     widths are the sidebar's, not the window's. */
+  grid-template-columns: repeat(var(--fav-cols, 4), minmax(0, 1fr));
+  gap: 8px;
+  min-height: 20px;
+}
+
+@media (min-width: 320px) { .fav-grid { --fav-cols: 5; } }
+@media (min-width: 384px) { .fav-grid { --fav-cols: 6; } }
+@media (min-width: 448px) { .fav-grid { --fav-cols: 7; } }
+@media (min-width: 512px) { .fav-grid { --fav-cols: 8; } }
+
+.fav-grid.empty {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 10px 28px;
+  border: 1.5px dashed var(--divider);
+  border-radius: var(--radius);
+  color: var(--muted);
+  text-align: center;
+  font-size: 12px;
+  transition: border-color 120ms, background 120ms;
+}
+
+.fav-drop-text { display: none; }
+
+/* No favorites yet: hidden until something is dragged over the sidebar. */
+.fav-grid.collapsed { display: none; }
+body.drag-active .fav-grid.collapsed { display: flex; }
+
+body.drag-active .fav-grid.empty {
+  border-color: color-mix(in srgb, var(--space) 60%, transparent);
+  background: color-mix(in srgb, var(--space) 8%, transparent);
+  color: var(--fg);
+}
+body.drag-active .fav-drop-text { display: inline; }
+
+/* Drop marks are drawn in the text color: the space color can match the
+   background (a light theme color at full intensity) and vanish. */
+.fav-grid.drag-over { outline: 2px solid var(--fg); outline-offset: 3px; border-radius: var(--radius); }
+
+.tile {
+  position: relative;
+  aspect-ratio: 1.25;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--tile);
+  display: grid;
+  place-items: center;
+  cursor: default;
+  transition: background 120ms, transform 120ms, opacity 120ms;
+}
+.tile:hover { background: var(--tile-hover); }
+.tile:active { transform: scale(0.96); }
+.tile.active { background: var(--tile-active); box-shadow: var(--shadow); }
+.tile.dragging { opacity: 0.4; }
+.tile.drop-before::before {
+  content: "";
+  position: absolute;
+  left: -5px; top: 15%; bottom: 15%;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--fg);
+}
+.tile .icon { width: 20px; height: 20px; display: grid; place-items: center; }
+.tile img { width: 20px; height: 20px; object-fit: contain; }
+
+.letter {
+  width: 20px; height: 20px;
+  border-radius: 5px;
+  display: grid; place-items: center;
+  font-size: 11px; font-weight: 600;
+  color: #fff;
+}
+
+/* ---------- Scroll area: space, pinned, today ---------- */
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* A hairline, and only while the list is in use — the sidebar shouldn't
+     spend width on a scrollbar. */
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  display: flex;
+  flex-direction: column;
+  margin: 0 -8px;
+  padding: 0 8px 8px;
+}
+
+.space-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 4px 0 6px;
+  font-weight: 600;
+  font-size: 13px;
+  color: color-mix(in srgb, var(--space) 45%, var(--fg));
+  border-radius: 8px;
+  cursor: pointer;
+}
+/* The space name sits above the scrolling list, not in it: it never scrolls
+   or bounces with the list. The list starts right under it. */
+.space-head + .scroll { margin-top: -8px; }
+.space-head:hover { background: var(--row-hover); }
+.space-head .chevron { display: grid; place-items: center; width: 16px; height: 16px; opacity: 0.7; }
+.space-head .chevron svg { width: 12px; height: 12px; transform: rotate(90deg); transition: transform 150ms ease; }
+body.pins-collapsed .space-head .chevron svg { transform: none; }
+.space-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.space-more { visibility: hidden; width: 24px; height: 24px; }
+.space-head:hover .space-more, .space-more:focus-visible { visibility: visible; }
+
+/* Pinned tabs scroll on their own, so open tabs below stay in view. */
+#pinned {
+  flex: none;
+  max-height: var(--pinned-height, 50vh); /* the divider can be dragged to change it */
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+#pinned:hover, #pinned:focus-within { scrollbar-color: var(--divider) transparent; }
+/* Folded away: only the pinned tabs that are open stay (see pinnedRows). */
+body.pins-collapsed #pinned:not(:has(.tab))::after { content: none; }
+/* Open tabs not docked (the divider's pin is off): the pinned list takes all
+   the room it needs and the open tabs follow it, the whole area scrolling. */
+body.today-flow #pinned { max-height: none; overflow: visible; }
+.space-head.drag-over { background: var(--row-hover); }
+
+/* Everything under the space header keeps its height; the area scrolls. */
+.scroll > * { flex-shrink: 0; }
+.scroll:hover, .scroll:focus-within { scrollbar-color: var(--divider) transparent; }
+
+.divider-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  padding: 6px 8px;
+}
+.divider { flex: 1; height: 1px; background: var(--divider); }
+
+/* Drag the divider (docked): up and down moves where the pinned list ends. */
+body:not(.today-flow):not(.pins-collapsed) .divider-row { cursor: row-resize; }
+body:not(.today-flow):not(.pins-collapsed) .divider-row:hover .divider,
+.divider-row.resizing .divider { height: 2px; background: var(--muted); }
+.divider-row button { cursor: default; }
+
+/* The pin at the divider's left: docks the open tabs (pinned list scrolls on its own) or not. */
+/* Like "Clear": shown only while the sidebar is hovered, and hidden means no
+   width, so the divider runs the whole way instead of stopping at an empty spot. */
+.dock-btn {
+  width: 0;
+  height: 20px;
+  margin-inline-end: 0;
+  overflow: hidden;
+  opacity: 0;
+  color: var(--muted);
+  transition: opacity 120ms, width 160ms, margin-inline-end 160ms;
+}
+.dock-btn svg { flex: none; width: 13px; height: 13px; }
+body:hover .dock-btn, .dock-btn:focus-visible { width: 20px; margin-inline-end: 6px; opacity: 1; }
+body.today-flow:hover .dock-btn { opacity: 0.6; }
+body .dock-btn:hover { opacity: 1; }
+
+/* "Clear" is hidden until the sidebar is hovered, and hidden means no width:
+   otherwise the divider stops short of an invisible label and reads as a
+   half-drawn line. */
+.link-btn {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  opacity: 0;
+  max-width: 0;
+  margin-inline-start: 0;
+  padding: 0;
+  overflow: hidden;
+  transition: opacity 120ms, max-width 160ms, margin-inline-start 160ms;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+body:hover .link-btn {
+  opacity: 1;
+  max-width: 6rem;
+  margin-inline-start: 6px;
+}
+.link-btn:hover { color: var(--fg); }
+
+/* ---------- Status bar ---------- */
+
+/* Pinned to the bottom, under the scrolling list: the tab count and "Close All". */
+.status-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  margin-top: -8px; /* the body's gap: the line sits right under the list */
+  padding: 0 2px 0 6px;
+  border-top: 1px solid var(--divider);
+  color: var(--muted);
+  font-size: 11px;
+}
+.tab-count { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.close-all {
+  flex: none;
+  height: 22px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: default;
+  transition: background 120ms, color 120ms;
+}
+.close-all:hover:not(:disabled) { background: var(--btn-hover); color: var(--fg); }
+.close-all:disabled { opacity: 0.4; }
+/* Armed: the next click closes everything. */
+.close-all.armed, .close-all.armed:hover { background: #e5484d; color: #fff; }
+
+/* "+": a soft card of its own, nothing like a tab row (an empty tab is one). */
+.new-tab {
+  flex: none;
+  display: grid;
+  place-items: center;
+  height: var(--row-height);
+  margin-bottom: var(--row-gap);
+  border: 0;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--row-active) 55%, transparent);
+  color: var(--fg);
+  cursor: default;
+  transition: background 120ms, transform 120ms;
+}
+.new-tab:hover { background: var(--row-active); }
+.new-tab:active { transform: scale(0.98); }
+.new-tab svg { width: 16px; height: 16px; }
+
+/* ---------- Rows ---------- */
+
+.tab-list { list-style: none; margin: 0; padding: 0; min-height: 4px; }
+.tab-list.grow { flex: 1 0 auto; min-height: 40px; }
+
+#pinned:not(:has(.tab))::after {
+  content: "Drag tabs here to pin them to the bookmarks bar";
+  display: block;
+  padding: 4px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--row-height);
+  margin-bottom: var(--row-gap);
+  padding: 0 6px 0 10px;
+  font-size: var(--row-font);
+  border-radius: 10px;
+  cursor: default;
+}
+.tab:hover { background: var(--row-hover); }
+.tab.active { background: var(--row-active); box-shadow: var(--shadow); }
+.tab.active:hover { background: var(--row-active); }
+.tab.dragging { opacity: 0.4; }
+
+/* Pinned items: only open ones can be closed. */
+.tab.item:not(.open) .close { display: none; }
+
+/* A pinned tab that navigated away from its pinned page: "<icon> / <name>".
+   The icon leads back to the pinned page. */
+.tab.item.moved .title::before {
+  content: "/";
+  margin-inline-end: 6px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.tab.item.moved .favicon { margin-inline-end: -4px; border-radius: 4px; cursor: pointer; }
+.tab.item.moved .favicon:hover { box-shadow: 0 0 0 3px var(--row-hover); background: var(--row-hover); }
+
+.tab.drop-before::before,
+.tab.drop-after::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  left: 8px; right: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--fg);
+  pointer-events: none;
+}
+.tab.drop-before::before { top: -2px; }
+.tab.drop-after::after { bottom: -2px; }
+/* In the pinned list the line starts at the level the drop lands on. */
+#pinned .tab.drop-before::before { left: calc(8px + var(--depth, 0) * var(--indent)); }
+#pinned .tab.drop-after::after { left: calc(8px + var(--drop-depth, var(--depth, 0)) * var(--indent)); }
+
+.tab .favicon { width: 16px; height: 16px; flex: none; display: grid; place-items: center; }
+.tab .favicon img { width: 16px; height: 16px; object-fit: contain; }
+.tab .favicon .letter { width: 16px; height: 16px; font-size: 9px; border-radius: 4px; }
+
+/* A bookmark or favorite with its tab open: a dot in the theme color, left of the
+   icon in a row, under it on a tile (like the Dock). Mixed with the text color:
+   the theme color alone can match the background and vanish. */
+:root { --open-dot: color-mix(in srgb, var(--space) 55%, var(--fg)); }
+.tab .favicon { position: relative; }
+.tab.item.open .favicon::before {
+  content: "";
+  position: absolute;
+  left: -9px; top: 50%;
+  width: 5px; height: 5px;
+  margin-top: -2.5px;
+  border-radius: 50%;
+  background: var(--open-dot);
+}
+.tile.open::after {
+  content: "";
+  position: absolute;
+  left: 50%; bottom: 5px;
+  width: 4px; height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--open-dot);
+}
+
+.tab.loading .favicon::after {
+  content: "";
+  width: 12px; height: 12px;
+  border: 2px solid var(--muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.tab.loading .favicon > * { display: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.tab .title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tab .close { visibility: hidden; width: 26px; height: 26px; border-radius: 7px; }
+.tab .close svg { width: 13px; height: 13px; }
+.tab:hover .close { visibility: visible; }
+.tab .audio {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  margin-inline-end: 2px;
+  border-radius: 6px;
+  color: var(--fg);
+  background: var(--tile);
+}
+.tab .audio svg { width: 14px; height: 14px; }
+.tab .audio:hover { background: var(--tile-hover); }
+.tab .audio[hidden] { display: none; }
+
+/* ---------- Context menu ---------- */
+
+.menu {
+  position: fixed;
+  max-width: calc(100vw - 8px);
+  max-height: calc(100vh - 8px);
+  overflow-y: auto;
+  z-index: 30;
+  min-width: 190px;
+  padding: 4px;
+  border-radius: 8px;
+  background: var(--menu-bg);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
+}
+.menu button {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  text-align: left;
+}
+.menu button:disabled { opacity: 0.4; }
+.menu button:not(:disabled):hover, .menu button:focus-visible { background: var(--space); color: var(--on-space); outline: none; }
+.menu button.danger:not(:disabled):hover { background: #e5484d; }
+.menu hr { border: 0; height: 1px; margin: 4px 6px; background: var(--divider); }
+.menu button.has-sub { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.menu .sub-arrow { font-size: 15px; line-height: 1; transition: transform 120ms; }
+.menu button.has-sub[aria-expanded="true"] .sub-arrow { transform: rotate(90deg); }
+/* A submenu folds open in place, indented under its item. */
+.menu .submenu { margin-inline-start: 12px; padding-inline-start: 4px; border-inline-start: 1px solid var(--divider); }
+.menu .submenu[hidden] { display: none; }
+
+/* ---------- Dialog ---------- */
+
+.dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.25);
+}
+.dialog[hidden] { display: none; }
+
+.dialog-card {
+  width: 100%;
+  max-width: 320px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 12px;
+  background: var(--menu-bg);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+}
+.dialog-card h2 { margin: 0; font-size: 14px; }
+.dialog-card .row { display: flex; gap: 8px; }
+
+.dialog-card input[type="text"], .dialog-card input:not([type]), .dialog-card select {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--field);
+  color: var(--fg);
+  font: inherit;
+  min-width: 0;
+}
+.dialog-card input:focus, .dialog-card select:focus { outline: 2px solid var(--space); outline-offset: -1px; }
+.dialog-card select { width: 100%; }
+
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--muted); }
+
+.actions { display: flex; justify-content: flex-end; gap: 8px; }
+.actions button {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: none;
+}
+.actions button.primary { border: 0; background: var(--space); color: var(--on-space); font-weight: 600; }
+.actions button.primary.danger { background: #e5484d; }
+.actions button.reset { margin-inline-end: auto; }
+
+/* Theme dialog: color picker and intensity slider. No dimmed backdrop, so
+   the sidebar behind it shows the color exactly as it will look. */
+.dialog:has(.theme-card, .sizing-card) { background: transparent; }
+/* Sizing sits at the bottom, so the rows it changes stay in view above it. */
+.dialog:has(.sizing-card) { align-items: flex-end; }
+.theme-card .hex-input { width: 88px; flex: none; font-variant-numeric: tabular-nums; }
+.theme-card input[type="color"] {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--field);
+}
+.theme-card input[type="range"] { width: 100%; accent-color: var(--space); }
+.range-head { display: flex; justify-content: space-between; }
+.sizing-card input[type="range"] { width: 100%; accent-color: var(--fg); }
+.range-value { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+/* ---------- Folders (pinned section) ---------- */
+
+.tab.folder .title { font-weight: 600; }
+.tab.folder .folder-icon { color: color-mix(in srgb, var(--space) 65%, var(--fg)); }
+.tab.folder .folder-icon,
+.tab.folder .folder-icon svg { width: var(--folder-icon); height: var(--folder-icon); }
+.tab.folder .title { flex: 1; min-width: 0; }
+.tab.folder .folder-emoji { font-size: calc(var(--folder-icon) - 3px); line-height: var(--folder-icon); }
+
+/* "Change Icon" dialog: a grid of emoji to pick from. */
+.emoji-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(32px, 1fr)); gap: 4px; }
+.emoji-grid .emoji {
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  font-size: 17px;
+}
+.emoji-grid .emoji:hover { background: var(--row-hover); }
+.emoji-grid .emoji.selected { box-shadow: inset 0 0 0 2px var(--space); }
+.tab.child { padding-left: calc(10px + var(--depth, 1) * var(--indent)); }
+
+.tab .rename,
+.space-head .rename {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  outline: 2px solid var(--space);
+  background: var(--field-focus);
+  color: var(--fg);
+  font: inherit;
+  font-weight: 600;
+}
+
+/* Multi-selection (Shift/Cmd-click). */
+.tab.selected, .half.selected {
+  background: color-mix(in srgb, var(--space) 22%, transparent);
+}
+.tab.selected.active, .half.selected.active {
+  box-shadow: var(--shadow), inset 0 0 0 1.5px color-mix(in srgb, var(--space) 60%, transparent);
+}
+
+/* Drag onto the middle of a folder: drop into it. */
+.tab.drop-into {
+  background: var(--row-hover);
+  box-shadow: inset 0 0 0 2px var(--fg);
+}
+
+
+/* Until the first render lands, the sidebar has no tabs, no space and no
+   favorites: show nothing rather than an empty "+ New Tab" and a blank header. */
+body.booting .scroll { visibility: hidden; }
+
+/* ---------- Chrome port ---------- */
+
+.tab-list.drag-over:empty, #today.drag-over { outline: 2px dashed var(--divider); outline-offset: 2px; border-radius: 10px; }
+.tab .folder-icon { flex: none; display: grid; place-items: center; }
+
+/* Emoji picker: quick choices, or search results over all emoji. */
+.emoji-picker { display: flex; flex-direction: column; gap: 8px; }
+.emoji-picker .emoji-grid { max-height: 220px; overflow-y: auto; scrollbar-width: thin; }
+.emoji-search {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--field);
+  color: var(--fg);
+  font: inherit;
+}
+.emoji-search:focus { outline: 2px solid var(--space); outline-offset: -1px; }
+.picker-empty { grid-column: 1 / -1; padding: 12px 0; color: var(--muted); font-size: 12px; text-align: center; }
+
+
+/* Badges other extensions put on tabs (e.g. Tab Driver's "AI" on agent-controlled tabs). */
+.tab .badges { display: flex; flex: none; gap: 4px; }
+.tab .badges:empty { display: none; }
+.tab .badge {
+  padding: 1px 5px;
+  border-radius: 5px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  color: var(--badge, var(--space));
+  background: color-mix(in srgb, var(--badge, var(--space)) 16%, transparent);
+}
+/* Icon badges (Lucide), e.g. Tab Driver's robot next to the sound icon: they look like the
+   sound button. Pulsing icons get a blinking green dot instead of blinking themselves. */
+.tab .badge.icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 6px;
+  color: var(--badge, var(--fg));
+  background: var(--tile);
+}
+.tab .badge.icon svg { width: 14px; height: 14px; }
+.tab .audio:not([hidden]) + .badges.start { margin-inline-start: -8px; } /* sit next to the sound icon */
+.tab .badge.pulse:not(.icon) { animation: badge-pulse 1.4s ease-in-out infinite; }
+.tab .badge.icon.pulse::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #34c759;
+  box-shadow: 0 0 0 1.5px var(--base);
+  animation: badge-pulse 1.2s ease-in-out infinite;
+}
+@keyframes badge-pulse { 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .tab .badge.pulse, .tab .badge.icon.pulse::after { animation: none; } }
+
+/* ---------- Folder menu button and colors ---------- */
+
+.tab.folder .folder-more { visibility: hidden; width: 26px; height: 26px; border-radius: 7px; margin-inline-start: auto; }
+.tab.folder:hover .folder-more, .tab.folder .folder-more:focus-visible { visibility: visible; }
+
+/* Colored folders: areas in one layer under the rows (laid out in sidepanel.js). */
+#pinned { position: relative; }
+#pinned > .areas { position: absolute; inset: 0; pointer-events: none; list-style: none; }
+.area {
+  position: absolute;
+  right: 0;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--c) var(--area-mix, 80%), transparent);
+}
+/* On a dark panel a pastel would swallow light text: only a hint of it. */
+:root[data-text="light"] .area { --area-mix: 22%; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-text]) .area { --area-mix: 22%; }
+}
+
+.color-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.color-swatch {
+  height: 34px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--c);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+}
+.color-swatch:hover { transform: scale(1.04); }
+.color-swatch.selected { box-shadow: 0 0 0 2px var(--menu-bg), 0 0 0 4px var(--fg); }
+.dialog-card input[type="color"] { width: 100%; height: 32px; padding: 2px; border: 1px solid var(--divider); border-radius: 8px; background: var(--field); }

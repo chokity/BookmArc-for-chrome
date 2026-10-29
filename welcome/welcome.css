@@ -1,0 +1,63 @@
+@import url("../shared/theme.css");
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg, color-mix(in srgb, var(--space) var(--tint), var(--base))); /* --bg: exact, from theme.js */
+  color: var(--fg);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.page { max-width: 640px; margin: 0 auto; padding: 56px 16px 64px; }
+
+header { text-align: center; margin-bottom: 32px; }
+.logo { border-radius: 14px; }
+h1 { margin: 12px 0 6px; font-size: 28px; letter-spacing: -0.01em; }
+.lede { margin: 0; color: var(--muted); }
+
+.step {
+  margin-bottom: 16px;
+  padding: 20px 22px;
+  border-radius: 14px;
+  background: var(--menu-bg);
+  box-shadow: var(--shadow);
+}
+.step h2 { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; font-size: 17px; }
+.step p { margin: 0 0 12px; }
+.step p:last-child { margin-bottom: 0; }
+.n {
+  display: grid;
+  place-items: center;
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  background: var(--space);
+  color: var(--on-space);
+  font-size: 13px;
+}
+
+.tips { margin: 0 0 14px; padding-left: 18px; }
+.tips li { margin-bottom: 6px; }
+
+.btn {
+  height: 34px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 9px;
+  background: var(--space);
+  color: var(--on-space);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn.secondary { background: var(--field); color: var(--fg); }
+
+kbd {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--field);
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.fine { color: var(--muted); font-size: 13px; text-align: center; }

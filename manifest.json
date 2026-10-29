@@ -1,0 +1,65 @@
+{
+  "manifest_version": 3,
+  "name": "BookmArc",
+  "version": "0.7.2",
+  "description": "Your Chrome bookmarks as an Arc-style side panel: the bookmarks bar as pinned tabs with folders and colors, favorites, your open tabs and a command bar.",
+  "minimum_chrome_version": "121",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "permissions": [
+    "tabs",
+    "storage",
+    "sidePanel",
+    "search",
+    "favicon",
+    "history",
+    "topSites",
+    "clipboardWrite",
+    "alarms",
+    "bookmarks"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Toggle BookmArc",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel/sidepanel.html"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+A"
+      },
+      "description": "Open BookmArc"
+    },
+    "command-bar": {
+      "suggested_key": {
+        "default": "Alt+Shift+T"
+      },
+      "description": "Open the command bar"
+    },
+    "edit-address": {
+      "suggested_key": {
+        "default": "Alt+Shift+L"
+      },
+      "description": "Open the command bar with the current tab's address"
+    },
+    "add-favorite": {
+      "suggested_key": {
+        "default": "Alt+Shift+D"
+      },
+      "description": "Add current tab to Favorites"
+    }
+  }
+}

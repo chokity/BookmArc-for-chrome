@@ -1,0 +1,1484 @@
+/* Side panel: favorites, the bookmarks bar as pinned tabs (with folders) and the
+   window's open tabs. All state lives in storage and bookmarks (shared/store.js)
+   and in Chrome's tabs; this page only draws it. */
+
+import { h, setIcon, syncChildren, showMenu, openDialog, pickIcon, inlineRename } from "./ui.js";
+import * as store from "../shared/store.js";
+import { paintTheme, themeText } from "../shared/theme.js";
+import { pretty } from "../shared/suggest.js";
+import { getBadges, tabMenuFor } from "../shared/badges.js";
+
+const els = {
+  favorites: document.getElementById("favorites"),
+  spaceHead: document.getElementById("space-head"),
+  spaceMore: document.getElementById("space-more"),
+  scroll: document.querySelector(".scroll"),
+  pinned: document.getElementById("pinned"),
+  dividerRow: document.querySelector(".divider-row"),
+  dockToday: document.getElementById("dock-today"),
+  today: document.getElementById("today"),
+  clear: document.getElementById("clear"),
+  tabCount: document.getElementById("tab-count"),
+  closeAll: document.getElementById("close-all"),
+  newTab: document.getElementById("new-tab"),
+  search: document.getElementById("search"),
+  searchClear: document.getElementById("search-clear"),
+};
+
+const S = {
+  windowId: null,
+  tabs: [],
+  favorites: [],
+  pins: [], // the bookmarks bar
+  bindings: {}, // tabId -> itemId
+  theme: {},
+  badges: new Map(), // tabId -> badges other extensions put on it
+};
+
+let themeDraft = null; // {tint, intensity} previewed by the theme dialog
+let renaming = false; // a title is being edited in place: hold re-renders until it's done
+let pendingRename = null; // a folder just created: rename it once its row is drawn
+let query = []; // the search field's words, lowercased; empty: no search
+
+const activeTab = () => S.tabs.find((t) => t.active);
+const tabById = (id) => S.tabs.find((t) => t.id === id);
+const pinById = (id) => S.pins.find((p) => p.id === id);
+const tabsOf = (itemId) => S.tabs.filter((t) => S.bindings[t.id] === itemId);
+/** The open tab of a favorite / pinned item: the active one, else the most recent. */
+const boundTab = (itemId) =>
+  tabsOf(itemId).reduce((a, b) => (a && (a.active || (a.lastAccessed || 0) >= (b.lastAccessed || 0)) ? a : b), null);
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const isMac = navigator.platform.startsWith("Mac");
+const isWebUrl = (url) => /^https?:\/\//i.test(url || "");
+
+/** Tabs that stand for a favorite or a pinned item show there, not among the open tabs. */
+function shownElsewhere(tab) {
+  const itemId = S.bindings[tab.id];
+  return !!itemId && (S.favorites.some((f) => f.id === itemId) || S.pins.some((p) => p.id === itemId));
+}
+
+/** An empty tab (Cmd+T, a fresh window): not listed, the "+" above the list stands for it. */
+const isBlank = (tab) => store.isNewTabUrl(tab.url || tab.pendingUrl);
+
+/** "Close Empty Tabs": the window's empty tabs, which the list doesn't show. */
+function closeEmptyTabsItem() {
+  const empty = S.tabs.filter((t) => isBlank(t) && !t.pinned).map((t) => t.id);
+  return {
+    label: empty.length > 1 ? `Close ${empty.length} Empty Tabs` : empty.length ? "Close Empty Tab" : "Close Empty Tabs",
+    disabled: !empty.length,
+    run: () => closeTabs(empty),
+  };
+}
+
+const todayTabs = () => S.tabs.filter((t) => !shownElsewhere(t) && !isBlank(t));
+
+/** The pinned item's tab is on another page than the one that was pinned. */
+const isMoved = (item, tab) => !!tab && isWebUrl(tab.url) && tab.url !== item.url;
+
+// ---------- Pins tree ----------
+
+const isFolder = (p) => p?.type === "folder";
+
+function parentOf(p, pins = S.pins) {
+  return p.parent && pins.some((x) => x.id === p.parent && isFolder(x)) ? p.parent : null;
+}
+
+/** ids of `id` and everything inside it. */
+function subtree(pins, id) {
+  const out = new Set([id]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const p of pins) if (!out.has(p.id) && out.has(parentOf(p, pins))) out.add(p.id), (grew = true);
+  }
+  return out;
+}
+
+/** An entry and everything inside it, in list order (copies, safe to change). */
+const blockOf = (pins, id) => {
+  const ids = subtree(pins, id);
+  return pins.filter((p) => ids.has(p.id)).map((p) => ({ ...p }));
+};
+
+/**
+ * Move `block` (an entry and its contents, in order) next to `targetId`:
+ * where = "before" | "after" | "into" | "end".
+ */
+function placeBlock(pins, block, targetId, where) {
+  const ids = new Set(block.map((p) => p.id));
+  const rest = pins.filter((p) => !ids.has(p.id));
+  const [head] = block;
+  const target = rest.find((p) => p.id === targetId);
+  if (!target || where === "end") {
+    delete head.parent;
+    return [...rest, ...block];
+  }
+  let index;
+  if (where === "before") {
+    head.parent = parentOf(target, rest) || undefined;
+    index = rest.indexOf(target);
+  } else {
+    const inside = subtree(rest, target.id);
+    index = rest.reduce((last, p, i) => (inside.has(p.id) ? i : last), rest.indexOf(target)) + 1;
+    if (where === "into") {
+      head.parent = target.id;
+      target.open = true;
+    } else {
+      head.parent = parentOf(target, rest) || undefined;
+    }
+  }
+  if (!head.parent) delete head.parent;
+  rest.splice(index, 0, ...block);
+  return rest;
+}
+
+const savePins = (pins) => store.savePins(pins);
+const updatePin = (id, change) => savePins(S.pins.map((p) => (p.id === id ? { ...p, ...change } : p)));
+
+// ---------- Rendering ----------
+
+const SVG = {
+  close: '<path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
+  more: '<circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/>',
+  folder:
+    '<path d="M2.5 4.5a1 1 0 0 1 1-1h3l1.5 1.5h4.5a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+  folderOpen:
+    '<path d="M2.5 11.5v-7a1 1 0 0 1 1-1h3l1.5 1.5h4a1 1 0 0 1 1 1V7M2.5 11.5 4.3 7.7a1 1 0 0 1 .9-.6h8.6a.6.6 0 0 1 .5.8l-1.6 3.8a1 1 0 0 1-.9.6H3.2a.7.7 0 0 1-.7-.8z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+};
+
+function svg(name) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  el.setAttribute("viewBox", "0 0 16 16");
+  el.innerHTML = SVG[name];
+  return el;
+}
+
+/** Lucide icons: 24-grid, 2px round strokes. https://lucide.dev (ISC) */
+const LUCIDE = {
+  volume:
+    "M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298zM16 9a5 5 0 0 1 0 6m3.364 3.364a9 9 0 0 0 0-12.728",
+  volumeOff:
+    "M11 4.702a.7.7 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.7.7 0 0 0 11 19.298zm5.5 9.798l5-5m-5 0l5 5",
+  // Badge icons other extensions can pick (see BADGE_ICONS in shared/badges.js).
+  bot: "M12 8V4H8M6 8h12a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2zM2 14h2M20 14h2M15 13v2M9 13v2",
+  sparkles:
+    "M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594zM20 2v4M22 4h-4M2 20a2 2 0 1 0 4 0a2 2 0 1 0-4 0",
+  // Lucide's "pin" and "pin-off", joined into one path each.
+  pin: "M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z",
+  pinOff:
+    "M12 17v5M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89M2 2l20 20M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11",
+};
+
+function lucide(d) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  el.setAttribute("viewBox", "0 0 24 24");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", d);
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", "2");
+  path.setAttribute("stroke-linecap", "round");
+  path.setAttribute("stroke-linejoin", "round");
+  el.append(path);
+  return el;
+}
+
+const rows = new Map(); // "t<tabId>" | "i<itemId>" -> <li>
+
+function rowFor(key, build) {
+  let el = rows.get(key);
+  if (!el) rows.set(key, (el = build()));
+  return el;
+}
+
+/** favicon, mute, badges, title, badges, close: the parts fillRow() updates. */
+const rowParts = () => [
+  h("span", { className: "favicon" }),
+  h("button", { className: "icon-btn audio", hidden: true }),
+  h("span", { className: "badges start" }),
+  h("span", { className: "title" }),
+  h("span", { className: "badges" }),
+  h("button", { className: "icon-btn close", title: "Close tab" }, svg("close")),
+];
+
+function fillRow(el, tab, { title, url, icon }) {
+  const [favicon, audio, startBadgesEl, titleEl, badgesEl] = el.children;
+  el.classList.toggle("active", !!tab?.active);
+  el.classList.toggle("discarded", !!tab?.discarded);
+  el.classList.toggle("loading", tab?.status === "loading" && !tab.discarded && !store.isNewTabUrl(url));
+  if (titleEl.textContent !== title) titleEl.textContent = title;
+  el.title = url ? `${title}\n${url}` : title;
+  setIcon(favicon, icon, url);
+  const muted = !!tab?.mutedInfo?.muted;
+  audio.hidden = !(tab?.audible || muted);
+  const want = muted ? "off" : "on";
+  if (audio.dataset.state !== want) {
+    audio.dataset.state = want;
+    audio.replaceChildren(lucide(muted ? LUCIDE.volumeOff : LUCIDE.volume));
+  }
+  audio.title = muted ? "Unmute tab" : "Mute tab";
+  const badges = (tab && S.badges.get(tab.id)) || [];
+  fillBadges(startBadgesEl, badges.filter((b) => b.position === "start"));
+  fillBadges(badgesEl, badges.filter((b) => b.position !== "start"));
+}
+
+/** Badges other extensions set on a tab (see "Tab badges" in background.js). */
+function fillBadges(el, badges) {
+  const key = JSON.stringify(badges);
+  if (el.dataset.key === key) return;
+  el.dataset.key = key;
+  el.replaceChildren(
+    ...badges.map((b) => {
+      const icon = LUCIDE[b.icon];
+      const className = ["badge", icon && "icon", b.pulse && "pulse"].filter(Boolean).join(" ");
+      const style = b.color ? { "--badge": b.color } : undefined;
+      return h("span", { className, title: b.title, style, "aria-label": b.label || b.title }, icon ? lucide(icon) : b.label);
+    })
+  );
+}
+
+/** Indent a pinned row by its folder depth (0 = top level). */
+function setLevel(el, depth) {
+  el.dataset.depth = String(depth);
+  el.classList.toggle("child", depth > 0);
+  el.style.setProperty("--depth", depth);
+}
+
+function tabRow(tab) {
+  const el = rowFor("t" + tab.id, () => h("li", { className: "tab", draggable: true, dataset: { tab: tab.id } }, ...rowParts()));
+  const url = tab.url || tab.pendingUrl || "";
+  fillRow(el, tab, { title: store.isNewTabUrl(url) ? "New Tab" : tab.title || pretty(url) || "New Tab", url, icon: tab.favIconUrl });
+  return el;
+}
+
+function itemRow(item, depth) {
+  const el = rowFor("i" + item.id, () =>
+    h("li", { className: "tab item", draggable: true, dataset: { item: item.id } }, ...rowParts())
+  );
+  setLevel(el, depth);
+  const tab = boundTab(item.id);
+  el.classList.toggle("open", !!tab);
+  // Once the tab has left the pinned page, the row reads "<icon> / <name>",
+  // and clicking the icon goes back to the pinned page. The name stays as it was.
+  const moved = isMoved(item, tab);
+  el.classList.toggle("moved", moved);
+  fillRow(el, tab, {
+    title: item.name || item.title || tab?.title || pretty(item.url),
+    url: tab?.url || item.url,
+    icon: tab?.favIconUrl,
+  });
+  el.querySelector(".favicon").title = moved ? `Back to ${item.name || item.title || item.url}` : "";
+  el.querySelector(".close").title = "Close tab (stays pinned)";
+  return el;
+}
+
+/** `open`: shown open (a search opens the folders its hits are in, without saving that). */
+function folderRow(folder, depth, open = folder.open) {
+  const el = rowFor("i" + folder.id, () =>
+    h(
+      "li",
+      { className: "tab folder", draggable: true, dataset: { item: folder.id } },
+      h("span", { className: "folder-icon" }),
+      h("span", { className: "title" }),
+      h("button", { className: "icon-btn folder-more", title: "Folder options" }, svg("more"))
+    )
+  );
+  setLevel(el, depth);
+  const [icon, title] = el.children;
+  const kind = folder.icon ? `emoji:${folder.icon}` : open ? "folderOpen" : "folder";
+  if (icon.dataset.kind !== kind) {
+    icon.dataset.kind = kind;
+    icon.replaceChildren(folder.icon ? h("span", { className: "folder-emoji" }, folder.icon) : svg(kind));
+  }
+  el.classList.toggle("expanded", !!open);
+  title.textContent = folder.name;
+  el.title = folder.name;
+  return el;
+}
+
+// ---------- Search ----------
+
+/** Every word of the search is in `text` (title and URL). */
+const matches = (...texts) => {
+  const hay = texts.filter(Boolean).join(" ").toLowerCase();
+  return query.every((w) => hay.includes(w));
+};
+
+/**
+ * What a search shows of the pinned list: the hits, everything inside a folder
+ * whose name is a hit, and the folders around them (shown open). null: no search.
+ */
+function searchHits() {
+  if (!query.length) return null;
+  const shown = new Set();
+  for (const p of S.pins) {
+    const hit = isFolder(p) ? matches(p.name) : matches(p.name, p.title, p.url);
+    if (!hit) continue;
+    for (const id of isFolder(p) ? subtree(S.pins, p.id) : [p.id]) shown.add(id);
+    // ...and the folders it's in.
+    for (let up = parentOf(p); up; up = parentOf(pinById(up))) shown.add(up);
+  }
+  return shown;
+}
+
+/**
+ * The pinned rows on screen. Like Arc, folding something away keeps its open
+ * tabs in view: a collapsed folder lists the pins inside it (at any depth) that
+ * have a tab open, right below it; with "Bookmarks" folded, only those pins
+ * show at all. A search shows its hits instead, folders opened.
+ */
+function pinnedRows() {
+  const hits = searchHits();
+  const out = [];
+  /** The pins inside `folderId`, at any depth, that have an open tab, in list order. */
+  const openInside = (folderId) => S.pins.filter((p) => !isFolder(p) && p.id !== folderId && subtree(S.pins, folderId).has(p.id) && boundTab(p.id));
+  const walk = (parent, depth) => {
+    for (const p of S.pins.filter((x) => parentOf(x) === parent)) {
+      if (hits && !hits.has(p.id)) continue;
+      if (isFolder(p)) {
+        const open = hits ? true : p.open;
+        out.push(folderRow(p, depth, open));
+        if (open) walk(p.id, depth + 1);
+        else for (const item of openInside(p.id)) out.push(itemRow(item, depth + 1));
+      } else {
+        out.push(itemRow(p, depth));
+      }
+    }
+  };
+  if (pinsCollapsed && !hits) {
+    for (const p of S.pins) if (!isFolder(p) && boundTab(p.id)) out.push(itemRow(p, 0));
+  } else walk(null, 0);
+  return out;
+}
+
+/** The open tabs on screen: all of them, or the search's hits. */
+const shownTodayTabs = () => (query.length ? todayTabs().filter((t) => matches(t.title, t.url)) : todayTabs());
+
+// ---------- Folder colors ----------
+
+/**
+ * A colored folder gets a rounded area behind its row and every row shown
+ * below it (its contents, or its open tabs while collapsed). The areas sit in
+ * one layer under the rows, measured from them; a subfolder's own color is an
+ * area inside its parent's, inset by its indent.
+ */
+const areaLayer = h("li", { className: "areas", role: "presentation" });
+
+function layoutAreas() {
+  const shown = [...els.pinned.querySelectorAll(".tab")];
+  const areas = [];
+  shown.forEach((el, i) => {
+    const folder = el.classList.contains("folder") && pinById(el.dataset.item);
+    if (!folder?.color) return;
+    const depth = Number(el.dataset.depth || 0);
+    let last = i;
+    while (last + 1 < shown.length && Number(shown[last + 1].dataset.depth || 0) > depth) last++;
+    const top = el.offsetTop;
+    const bottom = shown[last].offsetTop + shown[last].offsetHeight;
+    areas.push(
+      h("span", {
+        className: "area",
+        style: { top: `${top}px`, height: `${bottom - top}px`, left: `calc(${depth} * var(--indent))`, "--c": folder.color },
+      })
+    );
+  });
+  areaLayer.replaceChildren(...areas);
+}
+
+// Row heights change with Sizing, fonts and the panel's width: measure again.
+new ResizeObserver(() => layoutAreas()).observe(els.pinned);
+
+const FOLDER_COLORS = ["#f6d2d8", "#fbe3cf", "#f7e7c6", "#dcebd5", "#d9eeeb", "#d6e6f2", "#e3dcf2", "#e8e0d5"];
+
+/** "Set Color…": a swatch, a color of one's own (previewed while picking), or none. */
+async function setFolderColor(folder) {
+  const before = folder.color || "";
+  const preview = (color) => {
+    const shown = pinById(folder.id);
+    if (shown) shown.color = color;
+    layoutAreas();
+  };
+  const result = await openDialog((close) =>
+    h(
+      "form",
+      { className: "dialog-card", onsubmit: (e) => e.preventDefault() },
+      h("h2", {}, "Folder Color"),
+      h(
+        "div",
+        { className: "color-grid" },
+        FOLDER_COLORS.map((c) =>
+          h("button", {
+            type: "button",
+            className: `color-swatch${before === c ? " selected" : ""}`,
+            title: c,
+            style: { "--c": c },
+            onclick: () => close(c),
+          })
+        )
+      ),
+      h(
+        "label",
+        { className: "field" },
+        "Custom color",
+        h("input", {
+          type: "color",
+          value: before || FOLDER_COLORS[5],
+          oninput: (e) => preview(e.target.value),
+          onchange: (e) => close(e.target.value),
+        })
+      ),
+      h(
+        "div",
+        { className: "actions" },
+        before && h("button", { type: "button", className: "reset", onclick: () => close("") }, "No Color"),
+        h("button", { type: "button", dataset: { cancel: "" }, onclick: () => close(null) }, "Cancel")
+      )
+    )
+  );
+  if (result === null || result === before) {
+    preview(before);
+    return;
+  }
+  await updatePin(folder.id, { color: result });
+}
+
+const tiles = new Map(); // favorite id -> <button>
+
+function renderFavorites() {
+  const nodes = S.favorites.map((fav) => {
+    let el = tiles.get(fav.id);
+    if (!el) tiles.set(fav.id, (el = h("button", { className: "tile", draggable: true, dataset: { item: fav.id } }, h("span", { className: "icon" }))));
+    const tab = boundTab(fav.id);
+    el.classList.toggle("open", !!tab);
+    el.classList.toggle("active", !!tab?.active);
+    el.title = tab?.title || fav.title;
+    setIcon(el.firstChild, tab?.favIconUrl, fav.url);
+    return el;
+  });
+  for (const id of tiles.keys()) if (!S.favorites.some((f) => f.id === id)) tiles.delete(id);
+  const empty = nodes.length === 0;
+  els.favorites.classList.toggle("empty", empty);
+  els.favorites.classList.toggle("collapsed", empty);
+  syncChildren(els.favorites, empty ? [h("span", { className: "fav-drop-text" }, "Drop here to add a favorite")] : nodes);
+}
+
+/** The window's open tabs, as the status bar counts them: empty ones don't count, as in the list. */
+const openTabs = () => S.tabs.filter((t) => !isBlank(t));
+
+/** The status bar: how many tabs the window has open. */
+function renderStatus() {
+  const open = openTabs();
+  const pinned = open.filter(shownElsewhere).length;
+  els.tabCount.textContent = plural(open.length, "tab") + (pinned ? ` · ${pinned} pinned` : "");
+  if (!closeAllArmed) els.closeAll.disabled = !open.length;
+}
+
+function render() {
+  if (renaming) return; // refresh() runs again when the rename ends
+  // While the theme dialog is open it paints its own preview.
+  if (!themeDraft) paintTheme(S.theme);
+  const pinned = pinnedRows();
+  syncChildren(els.pinned, [areaLayer, ...pinned]);
+  layoutAreas();
+  const today = shownTodayTabs();
+  syncChildren(els.today, today.map(tabRow));
+  document.body.classList.toggle("searching", query.length > 0);
+  document.body.classList.toggle("no-hits", query.length > 0 && !pinned.length && !today.length);
+  const live = new Set([...S.tabs.map((t) => "t" + t.id), ...S.pins.map((p) => "i" + p.id)]);
+  for (const key of rows.keys()) if (!live.has(key)) rows.delete(key);
+  for (const key of selection) if (!live.has(key)) selection.delete(key);
+  applySelection();
+  renderFavorites();
+  renderStatus();
+  document.body.classList.toggle("pins-collapsed", pinsCollapsed);
+  document.body.classList.remove("booting");
+  if (pendingRename && rows.has("i" + pendingRename)) {
+    const id = pendingRename;
+    pendingRename = null;
+    startRename(id);
+  }
+}
+
+// ---------- Loading ----------
+
+let loading = null;
+let again = false;
+
+async function load() {
+  const [tabs, favorites, pins, bindings, theme, badges] = await Promise.all([
+    chrome.tabs.query({ windowId: S.windowId }),
+    store.getFavorites(),
+    store.getPins(),
+    store.getBindings(),
+    store.getTheme(),
+    getBadges(),
+  ]);
+  Object.assign(S, { tabs, favorites, pins, bindings, theme, badges });
+  render();
+}
+
+/** Reload everything, coalescing bursts of events into one pass. (A timer, not
+    requestAnimationFrame: that pauses while the panel is covered.) */
+function refresh() {
+  if (loading) {
+    again = true;
+    return;
+  }
+  loading = new Promise((r) => setTimeout(r, 16))
+    .then(load)
+    .catch((err) => console.error("BookmArc: refresh failed", err))
+    .finally(() => {
+      loading = null;
+      if (again) {
+        again = false;
+        refresh();
+      }
+    });
+}
+
+// ---------- Actions ----------
+
+/** Open (or switch to) a favorite or pinned item. */
+async function openItem(item) {
+  const tab = boundTab(item.id);
+  if (tab) {
+    await chrome.tabs.update(tab.id, { active: true });
+    return;
+  }
+  const created = await chrome.tabs.create({ windowId: S.windowId, url: item.url, active: true });
+  await store.bind(created.id, item.id);
+}
+
+const openInNewTab = (url) => chrome.tabs.create({ windowId: S.windowId, url, active: true });
+
+const openCommandBar = () => chrome.runtime.sendMessage({ type: "command-bar", windowId: S.windowId });
+
+async function addFavorite(tab) {
+  if (!tab?.url || S.favorites.some((f) => f.url === tab.url)) return;
+  const fav = { id: store.uid(), url: tab.url, title: tab.title || tab.url };
+  await store.saveFavorites([...S.favorites, fav]);
+  await store.bind(tab.id, fav.id);
+}
+
+/** Pin a tab (a new bookmark in the bar), at `targetId`/`where` in the list. */
+async function pinTab(tab, targetId = null, where = "end") {
+  if (!tab?.url) return;
+  const item = { id: store.uid(), url: tab.url, title: tab.title || tab.url };
+  await savePins(placeBlock(S.pins, [item], targetId, where));
+  await store.bind(tab.id, item.id);
+}
+
+/** Remove pinned entries (and what's inside them): their bookmarks go, their open tabs stay. */
+async function unpin(itemIds) {
+  const ids = new Set(itemIds.flatMap((id) => [...subtree(S.pins, id)]));
+  await store.unbindItems([...ids]);
+  await savePins(S.pins.filter((p) => !ids.has(p.id)));
+}
+
+async function removeFavorite(favId) {
+  await store.unbindItems([favId]);
+  await store.saveFavorites(S.favorites.filter((f) => f.id !== favId));
+}
+
+/** A pinned item becomes a favorite (same id: its open tab stays bound). */
+async function pinToFavorite(item, beforeId = null) {
+  const fav = { id: item.id, url: item.url, title: item.name || item.title };
+  const list = S.favorites.filter((f) => f.id !== item.id);
+  const at = beforeId ? list.findIndex((f) => f.id === beforeId) : -1;
+  list.splice(at >= 0 ? at : list.length, 0, fav);
+  await store.saveFavorites(list);
+  await savePins(S.pins.filter((p) => p.id !== item.id));
+}
+
+/** A favorite becomes a pinned item (same id). */
+async function favoriteToPin(fav, targetId = null, where = "end") {
+  await store.saveFavorites(S.favorites.filter((f) => f.id !== fav.id));
+  await savePins(placeBlock(S.pins, [{ id: fav.id, url: fav.url, title: fav.title }], targetId, where));
+}
+
+/** The tab of a favorite / pinned item back on the saved page. */
+async function backToSavedUrl(item) {
+  const tab = boundTab(item.id);
+  if (tab) await chrome.tabs.update(tab.id, { url: item.url, active: true });
+}
+
+/** Save the item tab's current page as the item's URL. */
+async function saveCurrentUrl(item) {
+  const tab = boundTab(item.id);
+  if (!tab || !isWebUrl(tab.url)) return;
+  const change = { url: tab.url, title: tab.title || tab.url };
+  if (S.favorites.some((f) => f.id === item.id)) {
+    await store.saveFavorites(S.favorites.map((f) => (f.id === item.id ? { ...f, ...change } : f)));
+  } else {
+    await updatePin(item.id, change);
+  }
+}
+
+/** Close tabs; if that takes the one on screen, the most recent other tab takes over (or a fresh one). */
+async function closeTabs(tabIds) {
+  if (!tabIds.length) return;
+  if (tabIds.includes(activeTab()?.id)) {
+    const rest = S.tabs.filter((t) => !tabIds.includes(t.id));
+    if (rest.length) {
+      const last = rest.reduce((a, b) => ((b.lastAccessed || 0) > (a.lastAccessed || 0) ? b : a));
+      await chrome.tabs.update(last.id, { active: true });
+    } else {
+      await chrome.tabs.create({ windowId: S.windowId, active: true });
+    }
+  }
+  await chrome.tabs.remove(tabIds);
+}
+
+/**
+ * A new folder, renamed in place right away. With entries (pinned items or
+ * folders) and/or tabs, they go into it, where the first entry was.
+ */
+async function newFolder({ parentId = null, pinIds = [], tabs = [] } = {}) {
+  const folder = { id: store.uid(), type: "folder", name: "New Folder", open: true };
+  let pins = S.pins.map((p) => ({ ...p }));
+  const first = pins.find((p) => pinIds.includes(p.id));
+  if (first) pins = placeBlock(pins, [folder], first.id, "before");
+  else pins = placeBlock(pins, [folder], parentId, parentId ? "into" : "end");
+  // Only the outermost picked entries move; what's inside them comes along.
+  const roots = pinIds.filter((id) => !pinIds.some((other) => other !== id && subtree(pins, other).has(id)));
+  for (const id of roots) pins = placeBlock(pins, blockOf(pins, id), folder.id, "into");
+  const items = tabs.filter((t) => t.url).map((t) => ({ tab: t, item: { id: store.uid(), url: t.url, title: t.title || t.url } }));
+  for (const { item } of items) pins = placeBlock(pins, [item], folder.id, "into");
+  pendingRename = folder.id;
+  await savePins(pins);
+  for (const { tab, item } of items) await store.bind(tab.id, item.id);
+}
+
+/** Take an entry out of its folder: right after that folder, one level up. */
+async function removeFromFolder(itemId) {
+  const entry = pinById(itemId);
+  const parent = entry && parentOf(entry);
+  if (parent) await savePins(placeBlock(S.pins, blockOf(S.pins, itemId), parent, "after"));
+}
+
+/** Delete a folder. keepItems: its contents move up a level ("Ungroup"); else they go too. */
+async function deleteFolder(folderId, { keepItems }) {
+  const folder = pinById(folderId);
+  if (!keepItems) return unpin([folderId]);
+  const pins = S.pins
+    .filter((p) => p.id !== folderId)
+    .map((p) => (p.parent === folderId ? { ...p, parent: folder.parent } : p));
+  for (const p of pins) if (!p.parent) delete p.parent;
+  await savePins(pins);
+}
+
+/** Open every pinned item inside a folder that isn't open yet. */
+async function openFolderItems(folderId) {
+  const items = S.pins.filter((p) => !isFolder(p) && subtree(S.pins, folderId).has(p.id) && p.id !== folderId);
+  for (const item of items) {
+    if (boundTab(item.id)) continue;
+    const tab = await chrome.tabs.create({ windowId: S.windowId, url: item.url, active: false });
+    await store.bind(tab.id, item.id);
+  }
+}
+
+/** Rename a pinned row in place: the bookmark's (or bookmark folder's) name. */
+function startRename(itemId) {
+  const entry = pinById(itemId);
+  const title = rows.get("i" + itemId)?.querySelector(".title");
+  if (!entry || !title) return;
+  renaming = true;
+  inlineRename(title, isFolder(entry) ? entry.name : title.textContent, async (name) => {
+    renaming = false;
+    if (name && name !== title.textContent) await updatePin(itemId, isFolder(entry) ? { name } : { name, title: name });
+    refresh();
+  });
+}
+
+async function changeFolderIcon(folder) {
+  const icon = await pickIcon(folder.icon);
+  if (icon === null || icon === (folder.icon || "")) return;
+  await updatePin(folder.id, { icon });
+}
+
+/** Theme dialog: any color, and how strongly it tints the panel. */
+async function editThemeColor() {
+  const theme = S.theme;
+  paintTheme({ ...theme, intensity: null }); // read the default intensity for this text color
+  const defaultIntensity = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--tint")) || 16;
+  themeDraft = { tint: store.themeColor(theme), intensity: store.themeIntensity(theme) ?? defaultIntensity };
+  const preview = () => paintTheme({ ...theme, ...themeDraft });
+  preview();
+  const result = await openDialog((close) => {
+    const setTint = (hex) => {
+      themeDraft.tint = hex.toLowerCase();
+      color.value = themeDraft.tint;
+      hexField.value = themeDraft.tint;
+      preview();
+    };
+    const color = h("input", { type: "color", value: themeDraft.tint, oninput: (e) => setTint(e.target.value) });
+    // Exact color as a hex code; taken once it's a complete #rrggbb.
+    const hexField = h("input", {
+      className: "hex-input",
+      value: themeDraft.tint,
+      spellcheck: false,
+      maxLength: 7,
+      oninput: (e) => {
+        const hex = e.target.value.trim().replace(/^#?/, "#");
+        if (/^#[0-9a-f]{6}$/i.test(hex)) {
+          themeDraft.tint = hex.toLowerCase();
+          color.value = themeDraft.tint;
+          preview();
+        }
+      },
+      onblur: () => (hexField.value = themeDraft.tint),
+    });
+    const value = h("span", { className: "range-value" }, `${Math.round(themeDraft.intensity)}%`);
+    const range = h("input", {
+      type: "range",
+      min: 0,
+      max: store.MAX_INTENSITY,
+      step: 1,
+      value: themeDraft.intensity,
+      oninput: (e) => {
+        themeDraft.intensity = Number(e.target.value);
+        value.textContent = `${themeDraft.intensity}%`;
+        preview();
+      },
+    });
+    return h(
+      "form",
+      { className: "dialog-card theme-card", onsubmit: (e) => (e.preventDefault(), close("save")) },
+      h("h2", {}, "Theme Color"),
+      h("label", { className: "field" }, "Color", h("span", { className: "row" }, color, hexField)),
+      h("label", { className: "field" }, h("span", { className: "range-head" }, "Intensity", value), range),
+      h(
+        "div",
+        { className: "actions" },
+        (theme.tint || Number.isFinite(theme.intensity) || theme.text) &&
+          h("button", { type: "button", className: "reset", onclick: () => close("reset") }, "Reset"),
+        h("button", { type: "button", dataset: { cancel: "" }, onclick: () => close(null) }, "Cancel"),
+        h("button", { type: "submit", className: "primary" }, "Save")
+      )
+    );
+  });
+  const draft = themeDraft;
+  themeDraft = null;
+  if (result === "save") await store.saveTheme({ ...theme, tint: draft.tint, intensity: draft.intensity });
+  else if (result === "reset") await store.saveTheme({});
+  else paintTheme(S.theme);
+}
+
+async function copy(text) {
+  await navigator.clipboard.writeText(text).catch(() => {});
+}
+
+// ---------- Sizing (font, row height, spacing, indent, folder icon) ----------
+
+const SIZING_KEY = "sidebarSizing"; // storage.local: {font, height, gap, indent, icon} in px, all panels
+const SIZING = [
+  // [key, label, CSS variable, min, max, the default (as in sidepanel.css)]
+  ["font", "Font Size", "--row-font", 11, 18, 14],
+  ["height", "Row Height", "--row-height", 26, 48, 36],
+  ["gap", "Row Spacing", "--row-gap", 0, 14, 5],
+  ["indent", "Folder Indent", "--indent", 6, 32, 16],
+  ["icon", "Folder Icon Size", "--folder-icon", 12, 26, 18],
+];
+
+/** Put sizes ({key: px}) on the page; missing keys fall back to sidepanel.css. */
+function applySizing(sizing = {}) {
+  for (const [key, , prop, min, max] of SIZING) {
+    const v = Number(sizing[key]);
+    if (Number.isFinite(v)) document.documentElement.style.setProperty(prop, `${Math.min(max, Math.max(min, v))}px`);
+    else document.documentElement.style.removeProperty(prop);
+  }
+}
+
+let sizing = {};
+
+/** "Sizing" dialog: a slider per size, previewed live; Save keeps it for every panel. */
+async function editSizing() {
+  const draft = Object.fromEntries(SIZING.map(([key, , , , , def]) => [key, sizing[key] ?? def]));
+  const result = await openDialog((close) =>
+    h(
+      "form",
+      { className: "dialog-card sizing-card", onsubmit: (e) => (e.preventDefault(), close("save")) },
+      h("h2", {}, "Sizing"),
+      SIZING.map(([key, label, , min, max]) => {
+        const value = h("span", { className: "range-value" }, `${draft[key]}px`);
+        const range = h("input", {
+          type: "range",
+          min,
+          max,
+          step: key === "font" ? 0.5 : 1,
+          value: draft[key],
+          oninput: (e) => {
+            draft[key] = Number(e.target.value);
+            value.textContent = `${draft[key]}px`;
+            applySizing(draft);
+          },
+        });
+        return h("label", { className: "field" }, h("span", { className: "range-head" }, label, value), range);
+      }),
+      h(
+        "div",
+        { className: "actions" },
+        h("button", { type: "button", className: "reset", onclick: () => close("reset") }, "Defaults"),
+        h("button", { type: "button", dataset: { cancel: "" }, onclick: () => close(null) }, "Cancel"),
+        h("button", { type: "submit", className: "primary" }, "Save")
+      )
+    )
+  );
+  if (result === "save") sizing = draft;
+  else if (result === "reset") sizing = {};
+  applySizing(sizing);
+  if (result) await chrome.storage.local.set({ [SIZING_KEY]: sizing });
+}
+
+// ---------- Divider: dock the open tabs, resize the pinned list ----------
+
+const TODAY_FLOW = "todayFlow"; // storage.local: true = open tabs follow the whole pinned list
+const PINNED_HEIGHT = "pinnedHeight"; // storage.local: px the pinned list may take while docked
+const PINS_COLLAPSED = "pinsCollapsed"; // storage.local: the pinned list is folded away
+
+/**
+ * The divider's pin. Docked (default): the pinned list scrolls on its own so
+ * the open tabs keep their place in view. Not docked: they sit below the
+ * whole pinned list and the panel scrolls.
+ */
+function applyTodayFlow(flow) {
+  document.body.classList.toggle("today-flow", flow);
+  els.dockToday.replaceChildren(lucide(flow ? LUCIDE.pinOff : LUCIDE.pin));
+  els.dockToday.title = flow ? "Keep open tabs in view (pinned tabs scroll on their own)" : "Let open tabs follow all pinned tabs";
+  els.dockToday.setAttribute("aria-pressed", String(!flow));
+}
+
+function applyPinnedHeight(px) {
+  if (Number.isFinite(px)) document.documentElement.style.setProperty("--pinned-height", `${px}px`);
+  else document.documentElement.style.removeProperty("--pinned-height");
+}
+
+els.dockToday.addEventListener("click", () => {
+  const flow = !document.body.classList.contains("today-flow");
+  applyTodayFlow(flow);
+  chrome.storage.local.set({ [TODAY_FLOW]: flow });
+});
+
+/**
+ * While docked, dragging the divider moves where the pinned list ends (it
+ * scrolls on its own above). It stops at the list's full length and leaves
+ * room for a few open tabs. Double-click: back to the default.
+ */
+{
+  const row = els.dividerRow;
+  const canResize = () => !document.body.classList.contains("today-flow") && !document.body.classList.contains("pins-collapsed");
+  row.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || e.target.closest("button") || !canResize()) return;
+    e.preventDefault();
+    const pinned = els.pinned;
+    const startY = e.clientY;
+    const startH = pinned.getBoundingClientRect().height;
+    const most = () => Math.min(pinned.scrollHeight, els.scroll.clientHeight - 120);
+    let height = startH;
+    row.setPointerCapture(e.pointerId);
+    row.classList.add("resizing");
+    const move = (ev) => {
+      height = Math.round(Math.max(40, Math.min(most(), startH + ev.clientY - startY)));
+      applyPinnedHeight(height);
+    };
+    const end = () => {
+      row.classList.remove("resizing");
+      row.removeEventListener("pointermove", move);
+      row.removeEventListener("pointerup", end);
+      row.removeEventListener("pointercancel", end);
+      if (height !== startH) chrome.storage.local.set({ [PINNED_HEIGHT]: height });
+    };
+    row.addEventListener("pointermove", move);
+    row.addEventListener("pointerup", end);
+    row.addEventListener("pointercancel", end);
+  });
+  row.addEventListener("dblclick", (e) => {
+    if (e.target.closest("button") || !canResize()) return;
+    applyPinnedHeight(undefined);
+    chrome.storage.local.remove(PINNED_HEIGHT);
+  });
+}
+
+let pinsCollapsed = false;
+
+// Layout preferences shared by every window's panel.
+chrome.storage.local.get([SIZING_KEY, TODAY_FLOW, PINNED_HEIGHT, PINS_COLLAPSED]).then((r) => {
+  applySizing((sizing = r[SIZING_KEY] || {}));
+  applyTodayFlow(!!r[TODAY_FLOW]);
+  applyPinnedHeight(r[PINNED_HEIGHT]);
+  pinsCollapsed = !!r[PINS_COLLAPSED];
+  // Before the first load there's nothing to draw yet; load() picks the flag up.
+  if (!document.body.classList.contains("booting")) render();
+});
+applyTodayFlow(false);
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (SIZING_KEY in changes) applySizing((sizing = changes[SIZING_KEY].newValue || {}));
+  if (TODAY_FLOW in changes) applyTodayFlow(!!changes[TODAY_FLOW].newValue);
+  if (PINNED_HEIGHT in changes) applyPinnedHeight(changes[PINNED_HEIGHT].newValue);
+  if (PINS_COLLAPSED in changes) {
+    pinsCollapsed = !!changes[PINS_COLLAPSED].newValue;
+    render();
+  }
+});
+
+// ---------- Selection (Shift / Cmd-click) ----------
+
+const selection = new Set(); // "i<itemId>" (pinned items, folders) / "t<tabId>" (tabs), as in `rows`
+let anchor = null;
+
+const keyOf = (row) => (row.dataset.item ? "i" + row.dataset.item : "t" + row.dataset.tab);
+
+function applySelection() {
+  for (const [key, el] of rows) el.classList.toggle("selected", selection.has(key));
+}
+
+function clearSelection() {
+  if (!selection.size) return;
+  selection.clear();
+  anchor = null;
+  applySelection();
+}
+
+/** Shift = range, Cmd (Ctrl elsewhere) = toggle. Returns true if the click was a selection click. */
+function handleSelectClick(e, row) {
+  const toggle = isMac ? e.metaKey : e.ctrlKey;
+  if (!row || (!e.shiftKey && !toggle)) {
+    clearSelection();
+    return false;
+  }
+  const key = keyOf(row);
+  if (e.shiftKey && anchor) {
+    // The range runs over the rows on screen, pinned and open tabs alike.
+    const keys = [...els.scroll.querySelectorAll(".tab[data-item], .tab[data-tab]")].map(keyOf);
+    const a = keys.indexOf(anchor);
+    const b = keys.indexOf(key);
+    selection.clear();
+    if (a >= 0 && b >= 0) for (let i = Math.min(a, b); i <= Math.max(a, b); i++) selection.add(keys[i]);
+    else selection.add(key);
+  } else {
+    if (selection.has(key)) selection.delete(key);
+    else selection.add(key);
+    anchor = key;
+  }
+  applySelection();
+  return true;
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") clearSelection();
+});
+
+/** The menu for several selected rows. */
+function selectionMenu() {
+  const keys = [...selection];
+  const pinIds = keys.filter((k) => k[0] === "i").map((k) => k.slice(1)).filter((id) => pinById(id));
+  const itemIds = pinIds.filter((id) => !isFolder(pinById(id)));
+  const tabs = keys.filter((k) => k[0] === "t").map((k) => tabById(Number(k.slice(1)))).filter(Boolean);
+  const links = [...itemIds.map((id) => boundTab(id)?.url || pinById(id)?.url), ...tabs.map((t) => t.url)].filter(Boolean);
+  const openTabs = [...itemIds.flatMap((id) => tabsOf(id).map((t) => t.id)), ...tabs.map((t) => t.id)];
+  const n = pinIds.length + tabs.length;
+  const done = (fn) => async () => {
+    await fn();
+    clearSelection();
+  };
+  return [
+    links.length && { label: "Copy Links", run: done(() => copy(links.join("\n"))) },
+    "-",
+    n && { label: `New Folder with ${plural(n, "Item")}`, run: done(() => newFolder({ pinIds, tabs })) },
+    openTabs.length && { label: `Close ${plural(openTabs.length, "Tab")}`, run: done(() => closeTabs(openTabs)) },
+    pinIds.length && {
+      label: pinIds.length === 1 ? "Remove Pin" : "Remove Pins",
+      danger: true,
+      run: done(() => unpin(pinIds)),
+    },
+  ].filter(Boolean);
+}
+
+// ---------- Context menus ----------
+
+async function tabMenu(tab) {
+  const list = todayTabs();
+  const at = list.findIndex((t) => t.id === tab.id);
+  const above = list.slice(0, Math.max(0, at));
+  const below = list.slice(at + 1);
+  const muted = !!tab.mutedInfo?.muted;
+  // Items other extensions added (e.g. "Let AI agents control this tab").
+  const extra = await tabMenuFor(tab.id).catch(() => []);
+  return [
+    { label: "Pin", run: () => pinTab(tab) },
+    { label: "Add to Favorites", run: () => addFavorite(tab) },
+    { label: "New Folder with This Tab", run: () => newFolder({ tabs: [tab] }) },
+    "-",
+    { label: "Duplicate", run: () => chrome.tabs.duplicate(tab.id) },
+    { label: "Reload", run: () => chrome.tabs.reload(tab.id) },
+    { label: muted ? "Unmute Tab" : "Mute Tab", run: () => chrome.tabs.update(tab.id, { muted: !muted }) },
+    { label: "Copy Link", run: () => copy(tab.url) },
+    { label: "Open in New Window", run: () => chrome.windows.create({ tabId: tab.id }) },
+    ...(extra.length
+      ? [
+          "-",
+          ...extra.map((item) => ({
+            label: item.title,
+            run: () =>
+              chrome.runtime.sendMessage(item.extensionId, { type: "bookmarc:menu-clicked", id: item.id, tabId: tab.id }).catch(() => {}),
+          })),
+        ]
+      : []),
+    "-",
+    closeEmptyTabsItem(),
+    { label: above.length ? `Close ${plural(above.length, "Tab")} Above` : "Close Tabs Above", disabled: !above.length, run: () => closeTabs(above.map((t) => t.id)) },
+    { label: below.length ? `Close ${plural(below.length, "Tab")} Below` : "Close Tabs Below", disabled: !below.length, run: () => closeTabs(below.map((t) => t.id)) },
+    { label: "Close Tab", danger: true, run: () => closeTabs([tab.id]) },
+  ];
+}
+
+/** "Close N Open Tabs" for the tabs of `items` (a folder's pins, the favorites); null if none are open. */
+function closeOpenTabsItem(items) {
+  const open = items.flatMap((p) => tabsOf(p.id).map((t) => t.id));
+  if (!open.length) return null;
+  return { label: `Close ${open.length} Open ${open.length === 1 ? "Tab" : "Tabs"}`, run: () => closeTabs(open) };
+}
+
+/** What any open tab's menu has: duplicate, reload, mute. Nothing without a tab. */
+function openTabActions(tab) {
+  if (!tab) return [];
+  const muted = !!tab.mutedInfo?.muted;
+  return [
+    "-",
+    { label: "Duplicate", run: () => chrome.tabs.duplicate(tab.id) },
+    { label: "Reload", run: () => chrome.tabs.reload(tab.id) },
+    { label: muted ? "Unmute Tab" : "Mute Tab", run: () => chrome.tabs.update(tab.id, { muted: !muted }) },
+  ];
+}
+
+function itemMenu(item) {
+  const tab = boundTab(item.id);
+  const moved = tab && tab.url !== item.url;
+  return [
+    { label: "Open in New Tab", run: () => openInNewTab(item.url) },
+    moved && { label: "Back to Saved URL", run: () => backToSavedUrl(item) },
+    moved && isWebUrl(tab.url) && { label: "Save Current URL", run: () => saveCurrentUrl(item) },
+    { label: "Rename", run: () => startRename(item.id) },
+    { label: "Copy Link", run: () => copy(item.url) },
+    ...openTabActions(tab),
+    "-",
+    { label: "Move to Favorites", run: () => pinToFavorite(item) },
+    { label: "New Folder with This Item", run: () => newFolder({ pinIds: [item.id] }) },
+    parentOf(item) && { label: "Remove from Folder", run: () => removeFromFolder(item.id) },
+    tab && { label: "Close Tab", run: () => closeTabs(tabsOf(item.id).map((t) => t.id)) },
+    { label: "Unpin", danger: true, run: () => unpin([item.id]) },
+  ].filter(Boolean);
+}
+
+function folderMenu(folder) {
+  const inside = [...subtree(S.pins, folder.id)].filter((id) => id !== folder.id);
+  const items = inside.map(pinById).filter((p) => p && !isFolder(p));
+  const closed = items.filter((p) => !boundTab(p.id));
+  const children = S.pins.filter((p) => parentOf(p) === folder.id);
+  return [
+    { label: "Rename", run: () => startRename(folder.id) },
+    { label: "Change Icon…", run: () => changeFolderIcon(folder) },
+    { label: "Set Color…", run: () => setFolderColor(folder) },
+    closed.length && { label: `Open ${plural(closed.length, "Tab")}`, run: () => openFolderItems(folder.id) },
+    // Its pins at any depth, so every folder above an open tab offers this too.
+    closeOpenTabsItem(items),
+    { label: folder.open ? "Collapse" : "Expand", run: () => updatePin(folder.id, { open: !folder.open }) },
+    { label: "New Nested Folder", run: () => newFolder({ parentId: folder.id }) },
+    parentOf(folder) && { label: "Remove from Folder", run: () => removeFromFolder(folder.id) },
+    "-",
+    children.length && { label: "Ungroup", run: () => deleteFolder(folder.id, { keepItems: true }) },
+    {
+      label: inside.length ? "Delete Folder and Pins" : "Delete Folder",
+      danger: true,
+      run: () => deleteFolder(folder.id, { keepItems: false }),
+    },
+  ].filter(Boolean);
+}
+
+function favoriteMenu(fav) {
+  const tab = boundTab(fav.id);
+  const moved = tab && tab.url !== fav.url;
+  return [
+    { label: "Open in New Tab", run: () => openInNewTab(fav.url) },
+    moved && { label: "Back to Saved URL", run: () => backToSavedUrl(fav) },
+    moved && isWebUrl(tab.url) && { label: "Save Current URL", run: () => saveCurrentUrl(fav) },
+    { label: "Copy Link", run: () => copy(fav.url) },
+    ...openTabActions(tab),
+    "-",
+    { label: "Pin", run: () => favoriteToPin(fav) },
+    tab && { label: "Close Tab", run: () => closeTabs(tabsOf(fav.id).map((t) => t.id)) },
+    closeOpenTabsItem(S.favorites),
+    { label: "Remove from Favorites", danger: true, run: () => removeFavorite(fav.id) },
+  ].filter(Boolean);
+}
+
+/** The header's menu: the panel's own settings. */
+function optionsMenu() {
+  const text = themeText(S.theme);
+  return [
+    { label: "New Folder", run: () => newFolder() },
+    // Every pinned tab that's open, in any folder.
+    closeOpenTabsItem(S.pins.filter((p) => !isFolder(p))),
+    closeEmptyTabsItem(),
+    "-",
+    { label: "Edit Theme Color…", run: editThemeColor },
+    { label: text === "light" ? "Use Dark Text" : "Use Light Text", run: () => store.saveTheme({ ...S.theme, text: text === "light" ? "dark" : "light" }) },
+    { label: "Sizing…", run: editSizing },
+  ].filter(Boolean);
+}
+
+document.addEventListener("contextmenu", async (e) => {
+  if (e.target.closest("input")) return;
+  e.preventDefault();
+  const row = e.target.closest(".tab[data-item], .tab[data-tab]");
+  if (row && selection.has(keyOf(row)) && selection.size > 1) {
+    showMenu(selectionMenu(), e.clientX, e.clientY);
+    return;
+  }
+  const tabEl = e.target.closest(".tab[data-tab]");
+  const itemEl = e.target.closest("[data-item]");
+  let items = null;
+  if (tabEl) {
+    const tab = tabById(Number(tabEl.dataset.tab));
+    if (tab) items = await tabMenu(tab);
+  } else if (itemEl?.classList.contains("tile")) {
+    const fav = S.favorites.find((f) => f.id === itemEl.dataset.item);
+    if (fav) items = favoriteMenu(fav);
+  } else if (itemEl) {
+    const entry = pinById(itemEl.dataset.item);
+    if (entry) items = isFolder(entry) ? folderMenu(entry) : itemMenu(entry);
+  } else if (e.target.closest("#space-head, #pinned, #today, .scroll")) items = optionsMenu();
+  if (items) showMenu(items, e.clientX, e.clientY);
+});
+
+// ---------- Clicks ----------
+
+els.scroll.addEventListener("click", (e) => {
+  const more = e.target.closest(".folder-more");
+  if (more) {
+    const folder = pinById(more.closest(".tab").dataset.item);
+    const r = more.getBoundingClientRect();
+    if (folder) showMenu(folderMenu(folder), r.left, r.bottom + 4);
+    return;
+  }
+  const row = e.target.closest(".tab[data-item], .tab[data-tab]");
+  if (handleSelectClick(e, row) || !row) return;
+  if (row.dataset.tab) {
+    const tab = tabById(Number(row.dataset.tab));
+    if (!tab) return;
+    if (e.target.closest(".close")) closeTabs([tab.id]);
+    else if (e.target.closest(".audio")) chrome.tabs.update(tab.id, { muted: !tab.mutedInfo?.muted });
+    else chrome.tabs.update(tab.id, { active: true });
+    return;
+  }
+  const entry = pinById(row.dataset.item);
+  if (!entry) return;
+  const tab = boundTab(entry.id);
+  if (isFolder(entry)) updatePin(entry.id, { open: !entry.open });
+  else if (e.target.closest(".close")) closeTabs(tabsOf(entry.id).map((t) => t.id));
+  else if (e.target.closest(".audio") && tab) chrome.tabs.update(tab.id, { muted: !tab.mutedInfo?.muted });
+  // The icon of a tab that moved on: back to the pinned page.
+  else if (row.classList.contains("moved") && e.target.closest(".favicon")) backToSavedUrl(entry);
+  else openItem(entry);
+});
+
+// Middle-click closes a tab (a pinned item stays).
+els.scroll.addEventListener("auxclick", (e) => {
+  if (e.button !== 1) return;
+  const tabEl = e.target.closest(".tab[data-tab]");
+  const itemEl = e.target.closest(".tab.item[data-item]");
+  if (tabEl) closeTabs([Number(tabEl.dataset.tab)]);
+  else if (itemEl) closeTabs(tabsOf(itemEl.dataset.item).map((t) => t.id));
+});
+
+document.addEventListener("mousedown", (e) => {
+  if (e.button === 1 && e.target.closest(".tab")) e.preventDefault(); // no autoscroll
+});
+
+// Double-click the empty space below the open tabs: a new tab (the command bar).
+els.today.addEventListener("dblclick", (e) => {
+  if (!e.target.closest(".tab")) openCommandBar();
+});
+
+els.favorites.addEventListener("click", (e) => {
+  const fav = S.favorites.find((f) => f.id === e.target.closest(".tile")?.dataset.item);
+  if (fav) openItem(fav);
+});
+
+els.spaceMore.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const r = els.spaceMore.getBoundingClientRect();
+  showMenu(optionsMenu(), r.left, r.bottom + 4);
+});
+
+// Double-click a folder's or pinned item's title: rename it.
+els.pinned.addEventListener("dblclick", (e) => {
+  const row = e.target.closest(".tab[data-item]");
+  if (row && e.target.closest(".title")) startRename(row.dataset.item);
+});
+
+// The header folds the pinned list away (remembered for every window).
+els.spaceHead.addEventListener("click", () => {
+  pinsCollapsed = !pinsCollapsed;
+  render();
+  chrome.storage.local.set({ [PINS_COLLAPSED]: pinsCollapsed });
+});
+
+// Empty tabs aren't listed, but they go too.
+els.clear.addEventListener("click", () => closeTabs(S.tabs.filter((t) => !shownElsewhere(t) && !t.pinned).map((t) => t.id)));
+
+// "Close All" in the status bar: every tab, pinned ones too. The first click
+// only arms it ("Close 12?"); a second one within a few seconds closes them.
+let closeAllArmed = null;
+
+function disarmCloseAll() {
+  clearTimeout(closeAllArmed);
+  closeAllArmed = null;
+  els.closeAll.classList.remove("armed");
+  els.closeAll.textContent = "Close All";
+  renderStatus();
+}
+
+els.closeAll.addEventListener("click", async () => {
+  // Empty tabs go too, though they aren't counted: the fresh one below replaces them.
+  const ids = S.tabs.map((t) => t.id);
+  if (!openTabs().length) return;
+  if (!closeAllArmed) {
+    els.closeAll.classList.add("armed");
+    els.closeAll.textContent = `Close ${openTabs().length}?`;
+    closeAllArmed = setTimeout(disarmCloseAll, 3000);
+    return;
+  }
+  disarmCloseAll();
+  // A fresh tab first: closing the last one would close the window.
+  await chrome.tabs.create({ windowId: S.windowId, active: true });
+  await chrome.tabs.remove(ids);
+});
+els.closeAll.addEventListener("blur", () => closeAllArmed && disarmCloseAll());
+
+/* "New Tab" opens the command bar (the service worker owns it). */
+els.newTab.addEventListener("click", openCommandBar);
+
+// ---------- Search field ----------
+
+// The "×" in the field: shown while there's text, empties it.
+els.searchClear.addEventListener("click", () => {
+  els.search.value = "";
+  els.search.dispatchEvent(new Event("input"));
+  els.search.focus();
+});
+
+els.search.addEventListener("input", () => {
+  els.searchClear.hidden = !els.search.value;
+  query = els.search.value.toLowerCase().split(/\s+/).filter(Boolean);
+  clearSelection();
+  render();
+});
+
+els.search.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    e.stopPropagation();
+    els.search.value = "";
+    els.search.dispatchEvent(new Event("input"));
+    els.search.blur();
+  } else if (e.key === "Enter" && query.length) {
+    // The first hit that isn't a folder: a pinned item, else an open tab.
+    e.preventDefault();
+    const row = els.scroll.querySelector(".tab.item[data-item], #today .tab[data-tab]");
+    if (row?.dataset.item) openItem(pinById(row.dataset.item));
+    else if (row) chrome.tabs.update(Number(row.dataset.tab), { active: true });
+  }
+});
+
+// Typing in the panel (outside a field) goes into the search; Cmd/Ctrl+F focuses it.
+document.addEventListener("keydown", (e) => {
+  if (e.target.closest?.("input, textarea") || !document.getElementById("dialog").hidden) return;
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    els.search.focus();
+    els.search.select();
+  } else if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.length === 1 && e.key !== " ") {
+    els.search.focus();
+  }
+});
+
+// ---------- Drag and drop ----------
+
+let drag = null; // { kind: "tab" | "pin" | "fav", id }
+
+document.addEventListener("dragstart", (e) => {
+  const tabEl = e.target.closest?.(".tab[data-tab]");
+  const itemEl = e.target.closest?.("[data-item]");
+  if (tabEl) drag = { kind: "tab", id: Number(tabEl.dataset.tab) };
+  else if (itemEl) drag = { kind: itemEl.classList.contains("tile") ? "fav" : "pin", id: itemEl.dataset.item };
+  else return;
+  (tabEl || itemEl).classList.add("dragging");
+  document.body.classList.add("drag-active");
+  e.dataTransfer.effectAllowed = "move";
+  const url = drag.kind === "tab" ? tabById(drag.id)?.url : [...S.pins, ...S.favorites].find((p) => p.id === drag.id)?.url;
+  if (url) e.dataTransfer.setData("text/uri-list", url);
+  e.dataTransfer.setData("text/plain", url || "");
+});
+
+function clearMarks() {
+  for (const el of document.querySelectorAll(".drop-before, .drop-after, .drop-into, .drag-over")) {
+    el.classList.remove("drop-before", "drop-after", "drop-into", "drag-over");
+    el.style.removeProperty("--drop-depth");
+  }
+}
+
+/** A tab dropped outside the browser window opens in a window of its own. */
+async function detachIfDroppedOutside(e, tabId) {
+  if (e.dataTransfer.dropEffect !== "none") return;
+  // Esc cancels a drag with the pointer wherever it was; a real drop has moved.
+  if (e.screenX === 0 && e.screenY === 0) return;
+  const win = await chrome.windows.get(S.windowId).catch(() => null);
+  if (!win || win.state === "fullscreen") return;
+  const inside =
+    e.screenX >= win.left && e.screenX <= win.left + win.width && e.screenY >= win.top && e.screenY <= win.top + win.height;
+  if (inside) return;
+  await chrome.windows.create({ tabId }).catch((err) => console.error("BookmArc: detaching the tab failed", err));
+}
+
+document.addEventListener("dragend", (e) => {
+  if (drag?.kind === "tab") detachIfDroppedOutside(e, drag.id);
+  drag = null;
+  document.body.classList.remove("drag-active");
+  for (const el of document.querySelectorAll(".dragging")) el.classList.remove("dragging");
+  clearMarks();
+});
+
+/** Where a drop over `row` lands: before / after it, or into it (folders, middle half). */
+function dropPosition(row, e) {
+  const r = row.getBoundingClientRect();
+  const y = (e.clientY - r.top) / r.height;
+  if (row.classList.contains("folder") && y > 0.25 && y < 0.75) return "into";
+  return y < 0.5 ? "before" : "after";
+}
+
+/**
+ * A drop after the last row of a folder can land on any level from that row's
+ * down to the next row's (top level after the last row): the pointer's x
+ * picks it, one level per indent step. Returns the entry to drop after.
+ */
+function climbOut(row, e) {
+  const depth = Number(row.dataset.depth || 0);
+  const next = row.nextElementSibling;
+  const nextDepth = next ? Number(next.dataset.depth || 0) : 0;
+  if (nextDepth >= depth) return { targetId: row.dataset.item, level: depth };
+  const indent = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--indent")) || 16;
+  const x = e.clientX - row.getBoundingClientRect().left - 10;
+  const level = Math.min(depth, Math.max(nextDepth, Math.round(x / indent)));
+  let target = pinById(row.dataset.item);
+  for (let i = level; i < depth && target; i++) target = pinById(parentOf(target));
+  return { targetId: target?.id || row.dataset.item, level };
+}
+
+/** What a drop at `e` would do, or null. */
+function dropTarget(e) {
+  if (!drag) return null;
+  if (e.target.closest("#favorites")) {
+    if (drag.kind === "pin" && isFolder(pinById(drag.id))) return null;
+    const tile = e.target.closest(".tile");
+    if (!tile) return { zone: "favorites", el: els.favorites, where: "end" };
+    // The right half of a tile drops after it, i.e. before the next one.
+    const r = tile.getBoundingClientRect();
+    const target = e.clientX > r.left + r.width / 2 ? tile.nextElementSibling : tile;
+    return target ? { zone: "favorites", el: target, targetId: target.dataset.item, where: "before" } : { zone: "favorites", el: els.favorites, where: "end" };
+  }
+  if (e.target.closest("#pinned, #space-head")) {
+    const row = e.target.closest("#pinned .tab");
+    if (!row) return { zone: "pinned", el: els.pinned, where: "end" };
+    if (row.dataset.item === drag.id) return null;
+    if (drag.kind === "pin" && subtree(S.pins, drag.id).has(row.dataset.item)) return null;
+    const where = dropPosition(row, e);
+    if (where === "after") {
+      const { targetId, level } = climbOut(row, e);
+      if (drag.kind === "pin" && subtree(S.pins, drag.id).has(targetId)) return null;
+      return { zone: "pinned", el: row, targetId, where, level };
+    }
+    return { zone: "pinned", el: row, targetId: row.dataset.item, where };
+  }
+  if (e.target.closest("#today, .divider-row, #new-tab")) {
+    if (drag.kind === "pin" && isFolder(pinById(drag.id))) return null;
+    const row = e.target.closest("#today .tab");
+    if (drag.kind === "tab" && row) return { zone: "today", el: row, targetTab: Number(row.dataset.tab), where: dropPosition(row, e) };
+    return { zone: "today", el: els.today };
+  }
+  return null;
+}
+
+const MARK = { before: "drop-before", after: "drop-after", into: "drop-into" };
+
+document.addEventListener("dragover", (e) => {
+  const target = dropTarget(e);
+  clearMarks();
+  if (!target) return;
+  e.preventDefault();
+  target.el.classList.add(MARK[target.where] || "drag-over");
+  // The drop line starts at the level the drop lands on.
+  if (target.level !== undefined) target.el.style.setProperty("--drop-depth", target.level);
+});
+
+document.addEventListener("drop", async (e) => {
+  const target = dropTarget(e);
+  const source = drag;
+  clearMarks();
+  if (!target || !source) return;
+  e.preventDefault();
+  const tab = source.kind === "tab" ? tabById(source.id) : null;
+  const pin = source.kind === "pin" ? pinById(source.id) : null;
+  const fav = source.kind === "fav" ? S.favorites.find((f) => f.id === source.id) : null;
+
+  if (target.zone === "favorites") {
+    if (tab) await addFavorite(tab);
+    if (pin) await pinToFavorite(pin, target.targetId);
+    if (fav && target.targetId !== fav.id) {
+      const rest = S.favorites.filter((f) => f.id !== fav.id);
+      const at = target.targetId ? rest.findIndex((f) => f.id === target.targetId) : -1;
+      rest.splice(at >= 0 ? at : rest.length, 0, fav);
+      await store.saveFavorites(rest);
+    }
+  } else if (target.zone === "pinned") {
+    if (tab) await pinTab(tab, target.targetId, target.where);
+    if (pin) await savePins(placeBlock(S.pins, blockOf(S.pins, pin.id), target.targetId, target.where));
+    if (fav) await favoriteToPin(fav, target.targetId, target.where);
+  } else if (target.zone === "today") {
+    if (tab && target.targetTab && target.targetTab !== tab.id) {
+      const other = tabById(target.targetTab);
+      const index = other.index + (target.where === "after" ? 1 : 0) - (tab.index < other.index ? 1 : 0);
+      await chrome.tabs.move(tab.id, { index });
+    }
+    if (pin) await unpin([pin.id]);
+    if (fav) await removeFavorite(fav.id);
+  }
+});
+
+// ---------- Startup ----------
+
+for (const event of [
+  chrome.tabs.onCreated,
+  chrome.tabs.onRemoved,
+  chrome.tabs.onUpdated,
+  chrome.tabs.onActivated,
+  chrome.tabs.onMoved,
+  chrome.tabs.onAttached,
+  chrome.tabs.onDetached,
+  chrome.storage.onChanged,
+  // The pinned tabs are the bookmarks bar: changes made in Chrome show up here.
+  chrome.bookmarks.onCreated,
+  chrome.bookmarks.onRemoved,
+  chrome.bookmarks.onChanged,
+  chrome.bookmarks.onMoved,
+  chrome.bookmarks.onChildrenReordered,
+]) {
+  event.addListener(refresh);
+}
+
+// ?window=<id> shows another window's tabs: lets the panel be opened as a page while developing.
+S.windowId = Number(new URLSearchParams(location.search).get("window")) || (await chrome.windows.getCurrent()).id;
+// Tabs opened before their bookmark existed (or while the extension was off) join their pinned rows.
+await store.adoptAll().catch((err) => console.error("BookmArc: binding open tabs failed", err));
+refresh();
